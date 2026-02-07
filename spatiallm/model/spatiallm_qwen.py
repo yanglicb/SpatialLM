@@ -72,6 +72,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 enc_mode=point_config["enc_mode"],
                 enable_fourier_encode=True,
                 num_bins=point_config["num_bins"],
+                enable_flash=False,
             )
             embed_channels = point_config["enc_channels"][-1]
         else:

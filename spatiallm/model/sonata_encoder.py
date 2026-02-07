@@ -266,6 +266,103 @@ class PointSequential(PointModule):
                     input = module(input)
         return input
 
+class Block(PointModule):
+    def __init__(
+        self,
+        channels,
+        num_heads,
+        patch_size=48,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        layer_scale=None,
+        norm_layer=nn.LayerNorm,
+        act_layer=nn.GELU,
+        pre_norm=True,
+        order_index=0,
+        cpe_indice_key=None,
+        enable_rpe=False,
+        enable_flash=True,
+        upcast_attention=False,
+        upcast_softmax=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.pre_norm = pre_norm
+        
+        self.cpe = PointSequential(
+            spconv.SubMConv3d(
+                channels,
+                channels,
+                kernel_size=3,
+                bias=True,
+                indice_key=cpe_indice_key,
+            ),
+            nn.Linear(channels, channels),
+            norm_layer(channels),
+        )
+
+        self.norm1 = norm_layer(channels)
+        self.attn = SerializedAttention(
+            channels,
+            patch_size=patch_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            order_index=order_index,
+            enable_rpe=enable_rpe,
+            enable_flash=enable_flash,
+            upcast_attention=upcast_attention,
+            upcast_softmax=upcast_softmax,
+        )
+        self.ls1 = (
+            LayerScale(channels, layer_scale) if layer_scale is not None else nn.Identity()
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(channels)
+        self.mlp = PointSequential(
+            Mlp(
+                in_features=channels,
+                hidden_features=int(channels * mlp_ratio),
+                act_layer=act_layer,
+                drop=proj_drop,
+            )
+        )
+        self.ls2 = (
+            LayerScale(channels, layer_scale) if layer_scale is not None else nn.Identity()
+        )
+
+    def forward(self, point: Point):
+        shortcut = point.feat
+        point = self.cpe(point)
+        point.feat = shortcut + point.feat
+        shortcut = point.feat
+        if self.pre_norm:
+            point = self.norm1(point)
+
+        point = self.drop_path(self.ls1(self.attn(point)))
+        
+        point.feat = shortcut + point.feat
+        if not self.pre_norm:
+            point = self.norm1(point)
+
+        shortcut = point.feat
+        if self.pre_norm:
+            point = self.norm2(point)
+        point = self.drop_path(self.ls2(self.mlp(point)))
+        point.feat = shortcut + point.feat
+        if not self.pre_norm:
+            point = self.norm2(point)
+        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+        return point
+
+
 
 class LayerScale(nn.Module):
     def __init__(
@@ -583,13 +680,19 @@ class Block(PointModule):
         )
 
     def forward(self, point: Point):
+        print("DEBUG: Block.forward called", flush=True)
         shortcut = point.feat
         point = self.cpe(point)
+        print("DEBUG: Block.cpe done", flush=True)
         point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
+        
+        print("DEBUG: Calling Block.attn", flush=True)
         point = self.drop_path(self.ls1(self.attn(point)))
+        print("DEBUG: Block.attn done", flush=True)
+
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm1(point)
@@ -832,6 +935,7 @@ class Sonata(PointModule, PyTorchModelHubMixin):
         num_bins=1280,
     ):
         super().__init__()
+        print(f"DEBUG: Sonata init called with enable_flash={enable_flash}", flush=True)
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
@@ -917,21 +1021,29 @@ class Sonata(PointModule, PyTorchModelHubMixin):
         )  # 63 for fourier encoding
 
     def forward(self, data_dict):
+        print("DEBUG: Sonata.forward called", flush=True)
         point = Point(data_dict)
         point = self.embedding(point)
+        print("DEBUG: Embedding done", flush=True)
 
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        print("DEBUG: Serialization done", flush=True)
         point.sparsify()
+        print("DEBUG: Sparsify done", flush=True)
 
+        print("DEBUG: Calling self.enc", flush=True)
         point = self.enc(point)
+        print("DEBUG: self.enc done", flush=True)
         context = point["sparse_conv_feat"].features
 
         if self.enable_fourier_encode:
+            print("DEBUG: Fourier encode start", flush=True)
             coords = point["grid_coord"]
             coords_normalised = coords / (self.reduced_grid_size - 1)
             encoded_coords = fourier_encode_vector(coords_normalised)
 
             context = torch.cat([context, encoded_coords], dim=-1)
             context = self.input_proj(context)
+            print("DEBUG: Fourier encode done", flush=True)
 
         return context

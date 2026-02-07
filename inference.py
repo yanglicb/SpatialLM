@@ -35,18 +35,26 @@ def preprocess_point_cloud(points, colors, grid_size, num_bins):
             ),
         ]
     )
-    point_cloud = transform(
-        {
-            "name": "pcd",
-            "coord": points.copy(),
-            "color": colors.copy(),
-        }
-    )
+    print("DEBUG: Inside preprocess_point_cloud", flush=True)
+    point_cloud_dict = {
+        "name": "pcd",
+        "coord": points.copy(),
+        "color": colors.copy(),
+    }
+    
+    try:
+        point_cloud = transform(point_cloud_dict)
+    except Exception as e:
+        print(f"Error in transform: {e}")
+        raise
+
     coord = point_cloud["grid_coord"]
     xyz = point_cloud["coord"]
     rgb = point_cloud["color"]
+    
     point_cloud = np.concatenate([coord, xyz, rgb], axis=1)
-    return torch.as_tensor(np.stack([point_cloud], axis=0))
+    res = torch.as_tensor(np.stack([point_cloud], axis=0)).float()
+    return res
 
 
 def generate_layout(
@@ -73,8 +81,7 @@ def generate_layout(
     task_prompt = DETECT_TYPE_PROMPT[detect_type]
     if detect_type != "arch" and categories:
         task_prompt = task_prompt.replace("boxes", ", ".join(categories))
-    print("Task prompt: ", task_prompt)
-
+    
     prompt = f"<|point_start|><|point_pad|><|point_end|>{task_prompt} The reference code is as followed: {code_template}"
 
     # prepare the conversation data
@@ -89,6 +96,7 @@ def generate_layout(
     input_ids = tokenizer.apply_chat_template(
         conversation, add_generation_prompt=True, return_tensors="pt"
     )
+    
     input_ids = input_ids.to(model.device)
 
     streamer = TextIteratorStreamer(
@@ -102,9 +110,11 @@ def generate_layout(
         do_sample=True,
         use_cache=True,
         temperature=temperature,
-        top_p=top_p,
         top_k=top_k,
+        top_p=top_p,
         num_beams=num_beams,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
     t = Thread(target=model.generate, kwargs=generate_kwargs)
     t.start()
